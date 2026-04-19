@@ -8,19 +8,18 @@
 #include <unistd.h>
 #include <dirent.h>
 
-// --- Prototypes to keep the compiler happy ---
+// --- Prototypes ---
 int object_write(int type, const void *data, size_t len, ObjectID *id_out);
 void hash_to_hex(const ObjectID *id, char *hex_out);
 int hex_to_hash(const char *hex, ObjectID *id_out);
 
-#define OBJ_BLOB 1 // Assumed from standard Git types
+#define OBJ_BLOB 1
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 IndexEntry* index_find(Index *index, const char *path) {
     for (int i = 0; i < index->count; i++) {
-        if (strcmp(index->entries[i].path, path) == 0)
-            return &index->entries[i];
+        if (strcmp(index->entries[i].path, path) == 0) return &index->entries[i];
     }
     return NULL;
 }
@@ -81,8 +80,7 @@ int index_status(const Index *index) {
             int is_tracked = 0;
             for (int i = 0; i < index->count; i++) {
                 if (strcmp(index->entries[i].path, ent->d_name) == 0) {
-                    is_tracked = 1; 
-                    break;
+                    is_tracked = 1; break;
                 }
             }
             
@@ -107,40 +105,70 @@ int index_status(const Index *index) {
 
 int index_load(Index *index) {
     index->count = 0;
-    
-    // Attempt to open the index file. If it doesn't exist, we start empty.
     FILE *f = fopen(".pes/index", "r");
     if (!f) return 0; 
 
-    char hex[65]; // 64 chars + null terminator
+    char hex[65];
     unsigned long mtime;
-    
-    // Parse each line based on the exact format: <mode> <hash> <mtime> <size> <path>
     while (fscanf(f, "%o %64s %lu %u %[^\n]\n", 
-                  &index->entries[index->count].mode,
-                  hex,
-                  &mtime,
-                  &index->entries[index->count].size,
-                  index->entries[index->count].path) == 5) {
+                  &index->entries[index->count].mode, hex, &mtime,
+                  &index->entries[index->count].size, index->entries[index->count].path) == 5) {
         
         index->entries[index->count].mtime_sec = mtime;
-        
         if (hex_to_hash(hex, &index->entries[index->count].hash) != 0) {
-            fclose(f);
-            return -1; // Parsing error
+            fclose(f); return -1;
         }
         
         index->count++;
-        if (index->count >= MAX_INDEX_ENTRIES) break; // Protect against overflow
+        if (index->count >= MAX_INDEX_ENTRIES) break;
     }
     
     fclose(f);
     return 0;
 }
 
+// Comparator function for sorting index entries by path
+static int compare_index_entries(const void *a, const void *b) {
+    return strcmp(((const IndexEntry *)a)->path, ((const IndexEntry *)b)->path);
+}
+
 int index_save(const Index *index) {
-    (void)index;
-    return -1;
+    // Make a mutable copy of the index so we can sort it
+    Index sorted_idx = *index;
+    qsort(sorted_idx.entries, sorted_idx.count, sizeof(IndexEntry), compare_index_entries);
+
+    // Create a temporary file
+    char temp_path[] = ".pes/index_tmp_XXXXXX";
+    int fd = mkstemp(temp_path);
+    if (fd < 0) return -1;
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(temp_path); return -1; }
+
+    // Write all entries to the temp file
+    for (int i = 0; i < sorted_idx.count; i++) {
+        char hex[65];
+        hash_to_hex(&sorted_idx.entries[i].hash, hex);
+        fprintf(f, "%06o %s %lu %u %s\n",
+                sorted_idx.entries[i].mode,
+                hex,
+                (unsigned long)sorted_idx.entries[i].mtime_sec,
+                sorted_idx.entries[i].size,
+                sorted_idx.entries[i].path);
+    }
+
+    // Ensure data is pushed all the way to the disk
+    fflush(f);
+    fsync(fd);
+    fclose(f); // Also closes 'fd'
+
+    // Atomically overwrite the old index with the new one
+    if (rename(temp_path, ".pes/index") != 0) {
+        unlink(temp_path);
+        return -1;
+    }
+
+    return 0;
 }
 
 int index_add(Index *index, const char *path) {
