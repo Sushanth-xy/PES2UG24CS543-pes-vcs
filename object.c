@@ -1,4 +1,10 @@
 // object.c — Content-addressable object store
+//
+// Every piece of data (file contents, directory listings, commits) is stored
+// as an "object" named by its SHA-256 hash. Objects are stored under
+// .pes/objects/XX/YYYYYY... where XX is the first two hex characters of the
+// hash (directory sharding).
+
 #include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +13,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <openssl/evp.h>
+
+// ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 void hash_to_hex(const ObjectID *id, char *hex_out) {
     for (int i = 0; i < HASH_SIZE; i++) {
@@ -46,6 +54,8 @@ int object_exists(const ObjectID *id) {
     return access(path, F_OK) == 0;
 }
 
+// ─── IMPLEMENTATION ─────────────────────────────────────────────────────────
+
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
     const char *type_str;
     if (type == OBJ_BLOB) type_str = "blob";
@@ -53,6 +63,7 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     else if (type == OBJ_COMMIT) type_str = "commit";
     else return -1;
 
+    // 1. Build the full object: header ("type size\0") + data
     char header[64];
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
     if (header_len < 0 || header_len >= (int)sizeof(header)) return -1;
@@ -65,38 +76,54 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     ((char *)full_data)[header_len] = '\0';
     memcpy((char *)full_data + header_len + 1, data, len);
 
+    // 2. Compute SHA-256 hash of the FULL object
     compute_hash(full_data, full_len, id_out);
 
+    // 3. Check if object already exists (deduplication)
     if (object_exists(id_out)) {
         free(full_data);
-        return 0;
+        return 0; // Success, already written
     }
 
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id_out, hex);
 
+    // 4. Create shard directory (.pes/objects/XX/)
     char dir_path[512];
     snprintf(dir_path, sizeof(dir_path), "%s/%.2s", OBJECTS_DIR, hex);
     mkdir(dir_path, 0755);
 
+    // 5. Write to a temporary file (Fix applied here to prevent GCC warning)
     char temp_path[512];
-    snprintf(temp_path, sizeof(temp_path), "%s/tmp_obj_XXXXXX", dir_path);
+    snprintf(temp_path, sizeof(temp_path), "%s/%.2s/tmp_obj_XXXXXX", OBJECTS_DIR, hex);
+    
     int fd = mkstemp(temp_path);
-    if (fd < 0) { free(full_data); return -1; }
-
-    if (write(fd, full_data, full_len) != (ssize_t)full_len) {
-        close(fd); unlink(temp_path); free(full_data); return -1;
+    if (fd < 0) { 
+        free(full_data); 
+        return -1; 
     }
 
+    if (write(fd, full_data, full_len) != (ssize_t)full_len) {
+        close(fd); 
+        unlink(temp_path); 
+        free(full_data); 
+        return -1;
+    }
+
+    // 6. fsync() the temporary file
     fsync(fd);
     close(fd);
 
+    // 7. rename() the temp file to the final path (atomic)
     char final_path[512];
     object_path(id_out, final_path, sizeof(final_path));
     if (rename(temp_path, final_path) != 0) {
-        unlink(temp_path); free(full_data); return -1;
+        unlink(temp_path); 
+        free(full_data); 
+        return -1;
     }
 
+    // 8. Open and fsync() the shard directory to persist the rename
     int dir_fd = open(dir_path, O_RDONLY);
     if (dir_fd >= 0) {
         fsync(dir_fd);
@@ -104,13 +131,14 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     }
 
     free(full_data);
-    return 0;
+    return 0; // Success
 }
 
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
     char path[512];
     object_path(id, path, sizeof(path));
 
+    // 1 & 2. Open and read the entire file
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
@@ -127,7 +155,7 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     }
     fclose(f);
 
-    // 3. Parse the header
+    // 3. Parse the header to extract the type string and size
     char *null_byte = memchr(full_data, '\0', file_size);
     if (!null_byte) { free(full_data); return -1; }
 
@@ -141,14 +169,14 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     ObjectID computed_id;
     compute_hash(full_data, file_size, &computed_id);
     if (memcmp(computed_id.hash, id->hash, HASH_SIZE) != 0) {
-        free(full_data); return -1; // Corruption detected
+        free(full_data); return -1; // Hash mismatch!
     }
 
     // 5. Set type_out
     if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
     else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
     else if (strcmp(type_str, "commit") == 0) *type_out = OBJ_COMMIT;
-    else { free(full_data); return -1; }
+    else { free(full_data); return -1; } // Unknown object type
 
     // 6. Allocate buffer for extracted data
     *data_out = malloc(parsed_len);
@@ -158,5 +186,5 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     *len_out = parsed_len;
 
     free(full_data);
-    return 0;
+    return 0; // Success
 }
