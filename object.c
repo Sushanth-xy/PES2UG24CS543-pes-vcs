@@ -53,12 +53,10 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     else if (type == OBJ_COMMIT) type_str = "commit";
     else return -1;
 
-    // 1. Build the header
     char header[64];
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
     if (header_len < 0 || header_len >= (int)sizeof(header)) return -1;
 
-    // Allocate buffer for header + '\0' + data
     size_t full_len = header_len + 1 + len;
     void *full_data = malloc(full_len);
     if (!full_data) return -1;
@@ -67,16 +65,48 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     ((char *)full_data)[header_len] = '\0';
     memcpy((char *)full_data + header_len + 1, data, len);
 
-    // 2. Compute SHA-256 of the FULL object
     compute_hash(full_data, full_len, id_out);
 
-    // 3. Check for deduplication
     if (object_exists(id_out)) {
         free(full_data);
-        return 0; // Object already exists, success
+        return 0;
     }
 
-    // TODO: Write to disk atomically
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id_out, hex);
+
+    // 4. Create shard directory
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "%s/%.2s", OBJECTS_DIR, hex);
+    mkdir(dir_path, 0755);
+
+    // 5. Write to a temporary file
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s/tmp_obj_XXXXXX", dir_path);
+    int fd = mkstemp(temp_path);
+    if (fd < 0) { free(full_data); return -1; }
+
+    if (write(fd, full_data, full_len) != (ssize_t)full_len) {
+        close(fd); unlink(temp_path); free(full_data); return -1;
+    }
+
+    // 6. fsync() the temp file
+    fsync(fd);
+    close(fd);
+
+    // 7. Atomic rename
+    char final_path[512];
+    object_path(id_out, final_path, sizeof(final_path));
+    if (rename(temp_path, final_path) != 0) {
+        unlink(temp_path); free(full_data); return -1;
+    }
+
+    // 8. Open and fsync the shard directory
+    int dir_fd = open(dir_path, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
 
     free(full_data);
     return 0;
