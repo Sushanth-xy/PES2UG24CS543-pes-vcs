@@ -1,11 +1,30 @@
-// tree.c — Tree object serialization and construction
 #include "tree.h"
 #include "pes.h"
+
+// Fallback definitions in case index.h is missing
+#ifndef _INDEX_H_DEFINED_
+#define _INDEX_H_DEFINED_
+typedef struct {
+    char path[512];
+    ObjectID id;
+} IndexEntry;
+
+typedef struct {
+    IndexEntry *entries;
+    int count;
+} Index;
+
+int index_load(Index *idx);
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
+// --- FIX: Tell the compiler about object_write ---
+int object_write(int type, const void *data, size_t len, ObjectID *id_out);
 
 #define MODE_FILE      0100644
 #define MODE_EXEC      0100755
@@ -14,6 +33,7 @@
 uint32_t get_file_mode(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) return 0;
+
     if (S_ISDIR(st.st_mode))  return MODE_DIR;
     if (st.st_mode & S_IXUSR) return MODE_EXEC;
     return MODE_FILE;
@@ -72,8 +92,10 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     size_t offset = 0;
     for (int i = 0; i < sorted_tree.count; i++) {
         const TreeEntry *entry = &sorted_tree.entries[i];
+        
         int written = sprintf((char *)buffer + offset, "%o %s", entry->mode, entry->name);
         offset += written + 1; 
+        
         memcpy(buffer + offset, entry->hash.hash, HASH_SIZE);
         offset += HASH_SIZE;
     }
@@ -83,7 +105,6 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     return 0;
 }
 
-// Recursively build tree objects from grouped paths
 static int build_tree_level(IndexEntry *entries, int count, int path_offset, ObjectID *out_id) {
     Tree tree;
     tree.count = 0;
@@ -94,17 +115,17 @@ static int build_tree_level(IndexEntry *entries, int count, int path_offset, Obj
         const char *slash = strchr(current_path, '/');
 
         if (!slash) {
-            // Handle file
             TreeEntry *te = &tree.entries[tree.count++];
+            
             uint32_t mode = get_file_mode(entries[i].path);
             te->mode = (mode == 0) ? MODE_FILE : mode; 
             
             strncpy(te->name, current_path, sizeof(te->name) - 1);
             te->name[sizeof(te->name) - 1] = '\0';
             te->hash = entries[i].id;
+            
             i++;
         } else {
-            // Handle directory
             int dir_len = slash - current_path;
             int j = i + 1;
             
@@ -117,31 +138,27 @@ static int build_tree_level(IndexEntry *entries, int count, int path_offset, Obj
                 }
             }
 
-            // 1. Recurse to build the subtree
             ObjectID dir_id;
             if (build_tree_level(&entries[i], j - i, path_offset + dir_len + 1, &dir_id) != 0) {
                 return -1;
             }
 
-            // 2. Add the directory to the current tree
             TreeEntry *te = &tree.entries[tree.count++];
             te->mode = MODE_DIR;
             strncpy(te->name, current_path, dir_len);
             te->name[dir_len] = '\0';
             te->hash = dir_id;
 
-            i = j; // Advance past the directory block
+            i = j; 
         }
     }
 
-    // 3. Serialize this tree level
     void *tree_data;
     size_t tree_len;
     if (tree_serialize(&tree, &tree_data, &tree_len) != 0) {
         return -1;
     }
 
-    // 4. Write it to the object store
     int result = object_write(OBJ_TREE, tree_data, tree_len, out_id);
     free(tree_data);
     
@@ -150,9 +167,17 @@ static int build_tree_level(IndexEntry *entries, int count, int path_offset, Obj
 
 int tree_from_index(ObjectID *id_out) {
     Index idx;
-    if (index_load(&idx) != 0) return -1;
-    if (idx.count == 0) return -1;
+    if (index_load(&idx) != 0) {
+        return -1;
+    }
+
+    if (idx.count == 0) {
+        return -1; 
+    }
+
+    int result = build_tree_level(idx.entries, idx.count, 0, id_out);
     
-    // Kick off the recursion starting at character offset 0
-    return build_tree_level(idx.entries, idx.count, 0, id_out);
+    if (idx.entries) free(idx.entries);
+    
+    return result;
 }
