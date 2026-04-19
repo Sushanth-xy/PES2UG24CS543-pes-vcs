@@ -75,12 +75,10 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id_out, hex);
 
-    // 4. Create shard directory
     char dir_path[512];
     snprintf(dir_path, sizeof(dir_path), "%s/%.2s", OBJECTS_DIR, hex);
     mkdir(dir_path, 0755);
 
-    // 5. Write to a temporary file
     char temp_path[512];
     snprintf(temp_path, sizeof(temp_path), "%s/tmp_obj_XXXXXX", dir_path);
     int fd = mkstemp(temp_path);
@@ -90,18 +88,15 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
         close(fd); unlink(temp_path); free(full_data); return -1;
     }
 
-    // 6. fsync() the temp file
     fsync(fd);
     close(fd);
 
-    // 7. Atomic rename
     char final_path[512];
     object_path(id_out, final_path, sizeof(final_path));
     if (rename(temp_path, final_path) != 0) {
         unlink(temp_path); free(full_data); return -1;
     }
 
-    // 8. Open and fsync the shard directory
     int dir_fd = open(dir_path, O_RDONLY);
     if (dir_fd >= 0) {
         fsync(dir_fd);
@@ -113,6 +108,32 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 }
 
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    // 1 & 2. Open and read the entire file
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size < 0) { fclose(f); return -1; }
+
+    void *full_data = malloc(file_size);
+    if (!full_data) { fclose(f); return -1; }
+
+    if (fread(full_data, 1, file_size, f) != (size_t)file_size) {
+        free(full_data); fclose(f); return -1;
+    }
+    fclose(f);
+
+    // Locate the null terminator between header and data
+    char *null_byte = memchr(full_data, '\0', file_size);
+    if (!null_byte) { free(full_data); return -1; }
+
+    // TODO: Verify integrity and extract data buffer
+    
+    free(full_data);
     return -1;
 }
