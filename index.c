@@ -127,17 +127,14 @@ int index_load(Index *index) {
     return 0;
 }
 
-// Comparator function for sorting index entries by path
 static int compare_index_entries(const void *a, const void *b) {
     return strcmp(((const IndexEntry *)a)->path, ((const IndexEntry *)b)->path);
 }
 
 int index_save(const Index *index) {
-    // Make a mutable copy of the index so we can sort it
     Index sorted_idx = *index;
     qsort(sorted_idx.entries, sorted_idx.count, sizeof(IndexEntry), compare_index_entries);
 
-    // Create a temporary file
     char temp_path[] = ".pes/index_tmp_XXXXXX";
     int fd = mkstemp(temp_path);
     if (fd < 0) return -1;
@@ -145,7 +142,6 @@ int index_save(const Index *index) {
     FILE *f = fdopen(fd, "w");
     if (!f) { close(fd); unlink(temp_path); return -1; }
 
-    // Write all entries to the temp file
     for (int i = 0; i < sorted_idx.count; i++) {
         char hex[65];
         hash_to_hex(&sorted_idx.entries[i].hash, hex);
@@ -157,12 +153,10 @@ int index_save(const Index *index) {
                 sorted_idx.entries[i].path);
     }
 
-    // Ensure data is pushed all the way to the disk
     fflush(f);
     fsync(fd);
-    fclose(f); // Also closes 'fd'
+    fclose(f);
 
-    // Atomically overwrite the old index with the new one
     if (rename(temp_path, ".pes/index") != 0) {
         unlink(temp_path);
         return -1;
@@ -172,6 +166,58 @@ int index_save(const Index *index) {
 }
 
 int index_add(Index *index, const char *path) {
-    (void)index; (void)path;
-    return -1;
+    // 1. Get file metadata using stat
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        fprintf(stderr, "error: could not stat '%s'\n", path);
+        return -1;
+    }
+
+    // 2. Read file contents into memory
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "error: could not open '%s'\n", path);
+        return -1;
+    }
+    
+    void *data = NULL;
+    if (st.st_size > 0) {
+        data = malloc(st.st_size);
+        if (!data) { fclose(f); return -1; }
+        
+        if (fread(data, 1, st.st_size, f) != (size_t)st.st_size) {
+            free(data); fclose(f); return -1;
+        }
+    }
+    fclose(f);
+
+    // 3. Write contents to the object store as a blob
+    ObjectID blob_id;
+    if (object_write(OBJ_BLOB, data, st.st_size, &blob_id) != 0) {
+        if (data) free(data);
+        return -1;
+    }
+    if (data) free(data);
+
+    // 4. Update or create the index entry
+    IndexEntry *entry = index_find(index, path);
+    if (!entry) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
+        entry = &index->entries[index->count++];
+        
+        strncpy(entry->path, path, sizeof(entry->path) - 1);
+        entry->path[sizeof(entry->path) - 1] = '\0';
+    }
+
+    // Assign standard Git-style octal permissions based on stat results
+    if (S_ISDIR(st.st_mode)) entry->mode = 0040000;
+    else if (st.st_mode & S_IXUSR) entry->mode = 0100755;
+    else entry->mode = 0100644;
+
+    entry->hash = blob_id;
+    entry->mtime_sec = st.st_mtime;
+    entry->size = st.st_size;
+
+    // 5. Commit the changes to disk
+    return index_save(index);
 }
