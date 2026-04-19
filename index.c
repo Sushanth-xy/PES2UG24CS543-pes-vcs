@@ -132,36 +132,58 @@ static int compare_index_entries(const void *a, const void *b) {
 }
 
 int index_save(const Index *index) {
-    Index sorted_idx = *index;
-    qsort(sorted_idx.entries, sorted_idx.count, sizeof(IndexEntry), compare_index_entries);
+    // 1. Allocate the copy on the heap (5.6 MB is too big for the stack!)
+    Index *sorted_idx = malloc(sizeof(Index));
+    if (!sorted_idx) return -1;
+    
+    // Copy the data over
+    *sorted_idx = *index;
+    
+    // Sort the heap-allocated copy
+    qsort(sorted_idx->entries, sorted_idx->count, sizeof(IndexEntry), compare_index_entries);
 
+    // Create a temporary file
     char temp_path[] = ".pes/index_tmp_XXXXXX";
     int fd = mkstemp(temp_path);
-    if (fd < 0) return -1;
-
-    FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); unlink(temp_path); return -1; }
-
-    for (int i = 0; i < sorted_idx.count; i++) {
-        char hex[65];
-        hash_to_hex(&sorted_idx.entries[i].hash, hex);
-        fprintf(f, "%06o %s %lu %u %s\n",
-                sorted_idx.entries[i].mode,
-                hex,
-                (unsigned long)sorted_idx.entries[i].mtime_sec,
-                sorted_idx.entries[i].size,
-                sorted_idx.entries[i].path);
+    if (fd < 0) {
+        free(sorted_idx);
+        return -1;
     }
 
+    FILE *f = fdopen(fd, "w");
+    if (!f) { 
+        close(fd); 
+        unlink(temp_path); 
+        free(sorted_idx);
+        return -1; 
+    }
+
+    // Write all entries to the temp file
+    for (int i = 0; i < sorted_idx->count; i++) {
+        char hex[65];
+        hash_to_hex(&sorted_idx->entries[i].hash, hex);
+        fprintf(f, "%06o %s %lu %u %s\n",
+                sorted_idx->entries[i].mode,
+                hex,
+                (unsigned long)sorted_idx->entries[i].mtime_sec,
+                sorted_idx->entries[i].size,
+                sorted_idx->entries[i].path);
+    }
+
+    // Ensure data is pushed all the way to the disk
     fflush(f);
     fsync(fd);
     fclose(f);
 
+    // Atomically overwrite the old index with the new one
     if (rename(temp_path, ".pes/index") != 0) {
         unlink(temp_path);
+        free(sorted_idx);
         return -1;
     }
 
+    // Free the massive 5.6 MB block of memory
+    free(sorted_idx);
     return 0;
 }
 
