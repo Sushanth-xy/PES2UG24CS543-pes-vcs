@@ -111,7 +111,6 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     char path[512];
     object_path(id, path, sizeof(path));
 
-    // 1 & 2. Open and read the entire file
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
@@ -128,12 +127,36 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     }
     fclose(f);
 
-    // Locate the null terminator between header and data
+    // 3. Parse the header
     char *null_byte = memchr(full_data, '\0', file_size);
     if (!null_byte) { free(full_data); return -1; }
 
-    // TODO: Verify integrity and extract data buffer
-    
+    char type_str[16];
+    size_t parsed_len;
+    if (sscanf((char *)full_data, "%15s %zu", type_str, &parsed_len) != 2) {
+        free(full_data); return -1;
+    }
+
+    // 4. Verify integrity
+    ObjectID computed_id;
+    compute_hash(full_data, file_size, &computed_id);
+    if (memcmp(computed_id.hash, id->hash, HASH_SIZE) != 0) {
+        free(full_data); return -1; // Corruption detected
+    }
+
+    // 5. Set type_out
+    if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
+    else if (strcmp(type_str, "commit") == 0) *type_out = OBJ_COMMIT;
+    else { free(full_data); return -1; }
+
+    // 6. Allocate buffer for extracted data
+    *data_out = malloc(parsed_len);
+    if (!*data_out) { free(full_data); return -1; }
+
+    memcpy(*data_out, null_byte + 1, parsed_len);
+    *len_out = parsed_len;
+
     free(full_data);
-    return -1;
+    return 0;
 }
