@@ -1,6 +1,6 @@
 // tree.c — Tree object serialization and construction
 #include "tree.h"
-#include "pes.h" // Assumes index structures and object_write are here
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,23 +83,55 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     return 0;
 }
 
-// Recursive helper definition
 static int build_tree_level(IndexEntry *entries, int count, int path_offset, ObjectID *out_id) {
-    // TODO: Implement parsing, grouping, and serialization
-    (void)entries; (void)count; (void)path_offset; (void)out_id;
-    return 0; 
+    Tree tree;
+    tree.count = 0;
+    int i = 0;
+
+    while (i < count) {
+        // Look at the remaining path for the current entry
+        const char *current_path = entries[i].path + path_offset;
+        const char *slash = strchr(current_path, '/');
+
+        if (!slash) {
+            // No slash means this is a file at the current directory level
+            TreeEntry *te = &tree.entries[tree.count++];
+            
+            uint32_t mode = get_file_mode(entries[i].path);
+            te->mode = (mode == 0) ? MODE_FILE : mode; // fallback if lstat fails
+            
+            strncpy(te->name, current_path, sizeof(te->name) - 1);
+            te->name[sizeof(te->name) - 1] = '\0';
+            te->hash = entries[i].id;
+            
+            i++; // Move to the next entry
+        } else {
+            // It's a directory. Find all contiguous entries that share this folder.
+            int dir_len = slash - current_path;
+            int j = i + 1;
+            
+            while (j < count) {
+                const char *next_path = entries[j].path + path_offset;
+                if (strncmp(current_path, next_path, dir_len) == 0 && next_path[dir_len] == '/') {
+                    j++;
+                } else {
+                    break; // Directory boundary ended
+                }
+            }
+
+            // TODO: Recurse into this subdirectory, get its hash, and add it to `tree`
+            
+            i = j; // Skip past all entries we just processed in the subdirectory
+        }
+    }
+
+    // TODO: Serialize and write the tree object
+    return 0;
 }
 
 int tree_from_index(ObjectID *id_out) {
     Index idx;
-    if (index_load(&idx) != 0) {
-        return -1;
-    }
-
-    if (idx.count == 0) {
-        return -1; // Cannot build a tree from an empty index
-    }
-
-    // Begin recursion starting at offset 0 of the paths
+    if (index_load(&idx) != 0) return -1;
+    if (idx.count == 0) return -1;
     return build_tree_level(idx.entries, idx.count, 0, id_out);
 }
